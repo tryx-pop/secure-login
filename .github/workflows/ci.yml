@@ -4,8 +4,14 @@ on:
   pull_request: {branches: [main]}
 permissions:
   contents: read
-  packages: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
+  # ---------- 1. Sécurité et qualité du code source ----------
   code-quality:
     runs-on: ubuntu-latest
     steps:
@@ -13,10 +19,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: "3.12"}
       - run: pip install -r requirements.txt flake8 bandit pip-audit pytest
-      - run: flake8 app --max-line-length 130
-      - run: bandit -r app -ll                 # SAST
-      - run: pip-audit -r requirements.txt     # dépendances vulnérables
-      - run: pytest -q
+      - run: flake8 app tests --max-line-length 130          # syntaxe / style
+      - run: bandit -r app -ll                               # SAST
+      - run: pip-audit -r requirements.txt                   # dépendances vulnérables (SCA)
+      - run: pytest -q                                       # tests unitaires
+
   secrets-scan:
     runs-on: ubuntu-latest
     steps:
@@ -24,41 +31,111 @@ jobs:
         with: {fetch-depth: 0}
       - uses: gitleaks/gitleaks-action@v2
         env: {GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+
+  # ---------- 2. Image Docker : build, validation, sécurité ----------
   docker:
     needs: [code-quality, secrets-scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Lint Dockerfile
+
+      - name: Lint du Dockerfile (Hadolint)
         uses: hadolint/hadolint-action@v3.1.0
         with: {dockerfile: Dockerfile, failure-threshold: error}
-      - name: Build
-        run: docker build -t secure-login:${{ github.sha }} .
-      - name: Smoke test (validation du fonctionnement)
-        run: |
-          KEY=$(python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
-          docker run -d --name t -p 8080:8080 -e SECRET_KEY=ci -e COOKIE_SECURE=0 \
-            -e DATA_ENCRYPTION_KEY=$KEY -e USERNAME_INDEX_KEY=ci -e DATABASE_URL=sqlite:////tmp/ci.db secure-login:${{ github.sha }}
-          for i in $(seq 10); do curl -fs localhost:8080/health && exit 0; sleep 2; done
-          docker logs t; exit 1
-      - name: Trivy (CVE de l'image, bloque si HIGH/CRITICAL)
+
+      - name: Scan des misconfigurations (Dockerfile, compose) - Trivy config
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: secure-login:${{ github.sha }}
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Build de l'image
+        run: docker build -t secure-login:ci .
+
+      - name: Validation - démarrage, santé, utilisateur non-root
+        run: bash scripts/ci-validate-container.sh
+
+      - name: Validation - test fonctionnel (inscription, connexion, CSRF, en-têtes)
+        run: pip install requests && python tests/smoke_container.py http://localhost:8080
+
+      - name: Scan des CVE de l'image (Trivy) - bloque si HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: secure-login:ci
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
-      - name: Push GHCR
-        if: github.ref == 'refs/heads/main'
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          docker tag secure-login:${{ github.sha }} ghcr.io/${{ github.repository }}:${{ github.sha }}
-          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
-  deploy:
+
+      - name: SBOM (inventaire des composants)
+        uses: anchore/sbom-action@v0
+        with:
+          image: secure-login:ci
+          artifact-name: sbom.spdx.json
+
+      - name: DAST - OWASP ZAP baseline sur le conteneur en marche
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: http://localhost:8080
+          fail_action: false            # passer à true une fois les alertes traitées
+          allow_issue_writing: false
+
+      - name: Logs du conteneur en cas d'échec
+        if: failure()
+        run: docker logs app
+
+  # ---------- 3. Publication de l'image (uniquement sur main) ----------
+  publish:
     if: github.ref == 'refs/heads/main'
     needs: docker
     runs-on: ubuntu-latest
-    environment: production        # approbation manuelle requise
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # signature keyless cosign
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: Déploiement (à adapter : Render / Fly.io / Azure Container Apps / VM + docker compose)
-        run: echo "Déployer ghcr.io/${{ github.repository }}:${{ github.sha }} via l'API/CLI du fournisseur"
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with: {registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}"}
+      - uses: docker/setup-buildx-action@v3
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+      - uses: sigstore/cosign-installer@v3
+      - name: Signature de l'image
+        run: cosign sign --yes ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+
+  # ---------- 4. Déploiement (à adapter à l'hébergeur choisi) ----------
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production          # approbation manuelle + secrets de l'environnement
+    steps:
+      - uses: sigstore/cosign-installer@v3
+      - name: Vérification de la signature avant déploiement
+        run: |
+          cosign verify ${{ env.IMAGE }}@${{ needs.publish.outputs.digest }} \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Déploiement
+        run: |
+          echo "A completer selon l'hebergeur (Render, Fly.io, AWS App Runner)"
+          echo "Image a deployer : ${{ env.IMAGE }}@${{ needs.publish.outputs.digest }}"
+      - name: Vérification post-déploiement
+        if: vars.APP_URL != ''
+        run: |
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors ${{ vars.APP_URL }}/health
+      - name: DAST sur l'environnement déployé
+        if: vars.APP_URL != ''
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.APP_URL }}
+          fail_action: false
