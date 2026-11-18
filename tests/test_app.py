@@ -19,7 +19,8 @@ c = main.app.test_client()
 
 def test_register_login_and_hash_not_plaintext():
     assert c.post("/register", data={"username": "alice", "password": "Correct-Horse-Battery42!"}).status_code == 302
-    row = sqlite3.connect(os.environ["DATABASE_URL"].replace("sqlite:///", "")).execute("SELECT username_enc, password_hash FROM users").fetchone()
+    db = sqlite3.connect(os.environ["DATABASE_URL"].replace("sqlite:///", ""))
+    row = db.execute("SELECT username_enc, password_hash FROM users").fetchone()
     assert b"alice" not in row[0] and row[1].startswith("$argon2id$")
     assert c.post("/login", data={"username": "alice", "password": "Correct-Horse-Battery42!"}).status_code == 302
     assert c.post("/login", data={"username": "alice", "password": "wrong"}).status_code == 200
