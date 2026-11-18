@@ -26,6 +26,9 @@ jobs:
 
   secrets-scan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read      # requis par gitleaks pour lister les commits d'une PR
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
