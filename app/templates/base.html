@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><title>Login sécurisé</title>
+<style>body{font-family:sans-serif;max-width:420px;margin:3rem auto}input{display:block;width:100%;margin:.5rem 0;padding:.5rem}</style></head>
+<body>
+{% with msgs = get_flashed_messages() %}{% for m in msgs %}<p><strong>{{ m }}</strong></p>{% endfor %}{% endwith %}
+{% block content %}{% endblock %}
+</body></html>

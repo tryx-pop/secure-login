@@ -1,0 +1,64 @@
+name: CI-CD
+on:
+  push: {branches: [main]}
+  pull_request: {branches: [main]}
+permissions:
+  contents: read
+  packages: write
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt flake8 bandit pip-audit pytest
+      - run: flake8 app --max-line-length 130
+      - run: bandit -r app -ll                 # SAST
+      - run: pip-audit -r requirements.txt     # dépendances vulnérables
+      - run: pytest -q
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: gitleaks/gitleaks-action@v2
+        env: {GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"}
+  docker:
+    needs: [code-quality, secrets-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with: {dockerfile: Dockerfile, failure-threshold: error}
+      - name: Build
+        run: docker build -t secure-login:${{ github.sha }} .
+      - name: Smoke test (validation du fonctionnement)
+        run: |
+          KEY=$(python3 -c "import base64,os;print(base64.urlsafe_b64encode(os.urandom(32)).decode())")
+          docker run -d --name t -p 8080:8080 -e SECRET_KEY=ci -e COOKIE_SECURE=0 \
+            -e DATA_ENCRYPTION_KEY=$KEY -e USERNAME_INDEX_KEY=ci -e DATABASE_URL=sqlite:////tmp/ci.db secure-login:${{ github.sha }}
+          for i in $(seq 10); do curl -fs localhost:8080/health && exit 0; sleep 2; done
+          docker logs t; exit 1
+      - name: Trivy (CVE de l'image, bloque si HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: secure-login:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Push GHCR
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker tag secure-login:${{ github.sha }} ghcr.io/${{ github.repository }}:${{ github.sha }}
+          docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: docker
+    runs-on: ubuntu-latest
+    environment: production        # approbation manuelle requise
+    steps:
+      - name: Déploiement (à adapter : Render / Fly.io / Azure Container Apps / VM + docker compose)
+        run: echo "Déployer ghcr.io/${{ github.repository }}:${{ github.sha }} via l'API/CLI du fournisseur"
